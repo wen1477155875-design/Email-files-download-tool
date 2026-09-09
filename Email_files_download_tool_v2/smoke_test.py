@@ -229,6 +229,12 @@ schedule:
         desc3 = pipeline.job_description(
             "Report Name：甲\r\nReport Job Description：bbbb.csv\r\nJob Submitted：乙")
         desc3_ok = desc3 == "bbbb.csv"
+        # E6：压缩包本身也按同一规则重命名（bbbb.csv -> bbbb.zip）
+        archive_renamed = any(p.name == "AOS数据报告2026.zip"
+                              for p in (tmp / "downloads").rglob("*"))
+        archive_original_left = any(p.name == "单文件.zip"
+                                    for p in (tmp / "downloads").rglob("*"))
+
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -247,6 +253,8 @@ schedule:
         ("单文件 zip 已按正文 Job Description 重命名（扩展名 .csv 被剥离）", renamed),
         ("重命名后原文件名不再存在", not original_left),
         ("三行正文格式精准提取 Job Description", desc3_ok),
+        ("压缩包已按同一规则重命名（单文件.zip -> AOS数据报告2026.zip）", archive_renamed),
+        ("压缩包原文件名不再存在", not archive_original_left),
     ]
 
     print("\n=== 断言结果 ===")

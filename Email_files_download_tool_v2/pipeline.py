@@ -73,24 +73,31 @@ def job_description(body: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-def _rename_by_job_desc(paths, desc: str, on_duplicate: str, logger) -> None:
-    """zip 只解出一个文件时，把文件重命名为正文里的 Report Job Description。"""
-    if len(paths) != 1:
-        logger.info("解压出 %d 个文件（非单个），跳过按正文重命名", len(paths))
-        return
-    src = Path(paths[0])
+def _desc_target(src: Path, desc: str, on_duplicate: str) -> Optional[Path]:
+    """按正文描述生成重命名目标路径（压缩包与解压文件共用同一规则）。
+
+    描述自带扩展名（如 bbbb.csv）时剥离掉，统一用原文件的扩展名；
+    扩展名必须以字母开头（避免把 "报告 v1.2" 的 ".2" 误当扩展名）。
+    """
     stem = sanitize_filename(desc)
-    # 描述里自带扩展名（如 bbbb.csv）时剥离掉，统一用原文件的扩展名；
-    # 扩展名必须以字母开头（避免把 "报告 v1.2" 的 ".2" 误当扩展名）。
     m = re.search(r"\.[A-Za-z][A-Za-z0-9]{0,5}$", stem)
     if m and m.group(0).lower() != src.suffix.lower():
         stem = stem[: m.start()]
     suffix = src.suffix
     if not stem.lower().endswith(suffix.lower()):
         stem += suffix
-    target = unique_path(clamp_path_length(src.parent / stem), on_duplicate)
+    return unique_path(clamp_path_length(src.parent / stem), on_duplicate)
+
+
+def _rename_by_job_desc(paths, desc: str, on_duplicate: str, logger) -> None:
+    """zip 只解出一个文件时，把文件重命名为正文里的 Report Job Description。"""
+    if len(paths) != 1:
+        logger.info("解压出 %d 个文件（非单个），跳过按正文重命名", len(paths))
+        return
+    src = Path(paths[0])
+    target = _desc_target(src, desc, on_duplicate)
     if target is None:
-        logger.info("跳过重命名（目标同名文件已存在）：%s", stem)
+        logger.info("跳过重命名（目标同名文件已存在）：%s", src.name)
         return
     if target != src:
         # replace 在 Windows 上可覆盖已存在的目标文件（rename 会报 FileExistsError）
@@ -260,6 +267,10 @@ def run_once(
                     })
                     logger.info("已保存 %s（%d 字节）", final_path, size)
 
+                    desc = ""
+                    if cfg.extract.rename_by_job_desc:
+                        desc = job_description(getattr(msg, "body", ""))
+
                     if dest_dir is not None:
                         outcome = extract_archive(
                             final_path,
@@ -273,13 +284,11 @@ def run_once(
                             stats["extracted"] += 1
                             stats["extract_files"] += int(outcome["files"])
                             logger.info("已解压 %s 个文件 -> %s", outcome["files"], dest_dir)
-                            if cfg.extract.rename_by_job_desc:
-                                desc = job_description(getattr(msg, "body", ""))
-                                if desc:
-                                    _rename_by_job_desc(
-                                        outcome.get("paths") or [], desc,
-                                        cfg.extract.on_duplicate, logger,
-                                    )
+                            if desc:
+                                _rename_by_job_desc(
+                                    outcome.get("paths") or [], desc,
+                                    cfg.extract.on_duplicate, logger,
+                                )
                             if cfg.extract.delete_archive:
                                 try:
                                     final_path.unlink()
@@ -289,6 +298,24 @@ def run_once(
                         else:
                             stats["extract_failed"] += 1
                             logger.error("解压失败 %s：%s", final_path, outcome["message"])
+
+                    # 压缩包本身也按同一规则重命名（如 bbbb.csv -> bbbb.zip），
+                    # 并同步更新记账路径，避免下次运行被判"文件丢失"而重复下载。
+                    if desc and final_path.exists():
+                        arc_target = _desc_target(final_path, desc, cfg.download.on_duplicate)
+                        if arc_target is not None and arc_target != final_path:
+                            try:
+                                final_path.replace(arc_target)
+                                logger.info("已按 Report Job Description 重命名压缩包：%s -> %s",
+                                            final_path.name, arc_target.name)
+                                final_path = arc_target
+                                rec = state.get_attachment(akey) or {}
+                                if rec:
+                                    rec = dict(rec)
+                                    rec["file"] = str(arc_target)
+                                    state.mark_attachment(akey, rec)
+                            except Exception as exc:
+                                logger.warning("重命名压缩包失败 %s：%s", final_path, exc)
 
                 if saved_here or failed_here:
                     if failed_here == 0 and not dry_run:
