@@ -93,7 +93,8 @@ def _rename_by_job_desc(paths, desc: str, on_duplicate: str, logger) -> None:
         logger.info("跳过重命名（目标同名文件已存在）：%s", stem)
         return
     if target != src:
-        src.rename(target)
+        # replace 在 Windows 上可覆盖已存在的目标文件（rename 会报 FileExistsError）
+        src.replace(target)
         logger.info("已按 Report Job Description 重命名：%s -> %s", src.name, target.name)
 
 

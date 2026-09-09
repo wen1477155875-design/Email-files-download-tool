@@ -42,8 +42,8 @@ download:
   skip_inline_images: true
   # 是否把"邮件内嵌的邮件对象"另存为 .msg
   save_embedded_msg: false
-  # 同名文件处理：rename（自动加 _1 _2）/ overwrite / skip
-  on_duplicate: rename
+  # 同名文件处理：rename（自动加 _1 _2）/ overwrite（直接覆盖）/ skip
+  on_duplicate: overwrite
   min_size_bytes: 0
   max_size_bytes: 104857600
   # 扩展名白名单，留空 = 不限制。例：["xlsx", "xls", "pdf", "zip"]

@@ -101,7 +101,7 @@ def _safe_dest(dest_root: Path, member_name: str) -> Optional[Path]:
 def extract_archive(
     zip_path: Path,
     dest_root: Path,
-    overwrite: str = "rename",
+    overwrite: str = "overwrite",
     max_files: int = 2000,
     max_total_bytes: int = 2 * 1024 * 1024 * 1024,
     max_ratio: float = 200.0,

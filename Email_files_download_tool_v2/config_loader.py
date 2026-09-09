@@ -169,7 +169,7 @@ def load_config(path: Path) -> Config:
             subfolder_template=str(ex_raw.get("subfolder_template", "{sender}/{date}/{archive}")),
             extensions=[str(e).strip().lower().lstrip(".")
                         for e in (ex_raw.get("extensions") or ["zip"]) if str(e).strip()] or ["zip"],
-            on_duplicate=str(ex_raw.get("on_duplicate", "rename")).lower(),
+            on_duplicate=str(ex_raw.get("on_duplicate", "overwrite")).lower(),
             delete_archive=bool(ex_raw.get("delete_archive", False)),
             rename_by_job_desc=bool(ex_raw.get("rename_by_job_desc", True)),
             max_files=int(ex_raw.get("max_files", 2000)),
