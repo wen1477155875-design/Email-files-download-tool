@@ -1,0 +1,693 @@
+// ============================================================
+// 云端剪贴板 Cloud Clipboard v6（Cloudflare Worker + KV）
+// v6：下载改为一次性令牌 + 服务器直出附件，绕开 blob 下载在嵌入式预览框里被拦截的问题
+// 部署方法：整段替换旧代码，改口令，Deploy。KV 绑定不变（CLIP_KV）。
+// ============================================================
+
+// ★★★ 把这里改成你现在正在用的那个口令（保持一致，各设备不用重新输）★★★
+const PASSWORD = "change-me-to-a-long-random-password";
+
+const KV_CUR = "current";
+const KV_HIS = "history";
+const KV_FILES = "files";
+const FILE_PREFIX = "file:";
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB（原始文件大小）
+const MAX_FILES = 50;
+
+function json(data, status) {
+  return new Response(JSON.stringify(data), {
+    status: status || 200,
+    headers: { "Content-Type": "application/json; charset=utf-8" }
+  });
+}
+
+function authed(request) {
+  return request.headers.get("X-Key") === PASSWORD;
+}
+
+function newId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    if (path === "/" || path === "/index.html") {
+      return new Response(PAGE, {
+        headers: { "Content-Type": "text/html; charset=utf-8" }
+      });
+    }
+
+    if (path.indexOf("/api/") === 0) {
+      // 凭一次性令牌下载：链接方式打开，不走 X-Key 头校验，令牌本身即凭证（3 分钟失效、用后即焚）
+      if (path === "/api/download" && request.method === "GET") {
+        if (!env.CLIP_KV) return json({ error: "KV 未绑定" }, 500);
+        const token = url.searchParams.get("t") || "";
+        if (!token) return json({ error: "缺少令牌" }, 400);
+        const fid = await env.CLIP_KV.get("dltoken:" + token);
+        if (!fid) return json({ error: "链接已失效，请重新点下载" }, 410);
+        await env.CLIP_KV.delete("dltoken:" + token);
+        const dlFiles = (await env.CLIP_KV.get(KV_FILES, "json")) || [];
+        const df = dlFiles.find(function (x) { return x.id === fid; });
+        if (!df) return json({ error: "文件不存在" }, 404);
+        const drec = await env.CLIP_KV.get(FILE_PREFIX + df.id, "json");
+        if (!drec) return json({ error: "文件内容不存在" }, 404);
+        const bin = Uint8Array.from(atob(drec.data), function (c) { return c.charCodeAt(0); });
+        const asciiName = df.name.replace(/["\r\n]/g, "_").replace(/[^\x20-\x7E]/g, "_");
+        return new Response(bin, {
+          headers: {
+            "Content-Type": df.type || "application/octet-stream",
+            "Content-Disposition": "attachment; filename=\"" + asciiName + "\"; filename*=UTF-8''" + encodeURIComponent(df.name),
+            "Content-Length": String(bin.length),
+            "Cache-Control": "no-store"
+          }
+        });
+      }
+      if (!authed(request)) return json({ error: "口令不正确" }, 401);
+      if (!env.CLIP_KV) return json({ error: "KV 未绑定：请到 Worker 的 Settings -> Bindings 里绑定 CLIP_KV" }, 500);
+
+      // ---------- 文字剪贴板 ----------
+      if (path === "/api/get" && request.method === "GET") {
+        const cur = (await env.CLIP_KV.get(KV_CUR, "json")) || { text: "", updatedAt: 0 };
+        const his = (await env.CLIP_KV.get(KV_HIS, "json")) || [];
+        return json({ text: cur.text, updatedAt: cur.updatedAt, history: his });
+      }
+
+      if (path === "/api/save" && request.method === "POST") {
+        const body = await request.json().catch(function () { return {}; });
+        const text = typeof body.text === "string" ? body.text : "";
+        const now = Date.now();
+        const prev = (await env.CLIP_KV.get(KV_CUR, "json")) || { text: "", updatedAt: 0 };
+        let his = (await env.CLIP_KV.get(KV_HIS, "json")) || [];
+        if (prev.text && prev.text !== text) {
+          his.unshift({ text: prev.text, updatedAt: prev.updatedAt });
+          his = his.slice(0, 20);
+          await env.CLIP_KV.put(KV_HIS, JSON.stringify(his));
+        }
+        await env.CLIP_KV.put(KV_CUR, JSON.stringify({ text: text, updatedAt: now }));
+        return json({ ok: true, updatedAt: now, history: his });
+      }
+
+      if (path === "/api/clear" && request.method === "POST") {
+        const now = Date.now();
+        await env.CLIP_KV.put(KV_CUR, JSON.stringify({ text: "", updatedAt: now }));
+        return json({ ok: true, updatedAt: now });
+      }
+
+      // ---------- 文件 ----------
+      if (path === "/api/files" && request.method === "GET") {
+        const files = (await env.CLIP_KV.get(KV_FILES, "json")) || [];
+        return json({ files: files });
+      }
+
+      if (path === "/api/upload" && request.method === "POST") {
+        const body = await request.json().catch(function () { return {}; });
+        const name = typeof body.name === "string" && body.name ? body.name : "未命名文件";
+        const type = typeof body.type === "string" ? body.type : "";
+        const data = typeof body.data === "string" ? body.data : "";
+        if (!data) return json({ error: "文件内容为空" }, 400);
+        // base64 长度约 4/3 倍，据此估算原始大小
+        const approxSize = Math.floor(data.length * 3 / 4);
+        if (approxSize > MAX_FILE_SIZE) return json({ error: "文件超过 10 MB 上限" }, 413);
+        const id = newId();
+        const now = Date.now();
+        await env.CLIP_KV.put(FILE_PREFIX + id, JSON.stringify({ name: name, type: type, data: data }));
+        let files = (await env.CLIP_KV.get(KV_FILES, "json")) || [];
+        files.unshift({ id: id, name: name, size: approxSize, type: type, updatedAt: now });
+        // 超出数量上限时，连同最旧的文件数据一起删掉
+        while (files.length > MAX_FILES) {
+          const old = files.pop();
+          if (old && old.id) await env.CLIP_KV.delete(FILE_PREFIX + old.id);
+        }
+        await env.CLIP_KV.put(KV_FILES, JSON.stringify(files));
+        return json({ ok: true, files: files });
+      }
+
+      if (path.indexOf("/api/file/") === 0 && request.method === "GET") {
+        const id = decodeURIComponent(path.slice("/api/file/".length));
+        const rec = await env.CLIP_KV.get(FILE_PREFIX + id, "json");
+        if (!rec) return json({ error: "文件不存在" }, 404);
+        return json(rec);
+      }
+
+      if (path === "/api/download-token" && request.method === "POST") {
+        const body = await request.json().catch(function () { return {}; });
+        const id = typeof body.id === "string" ? body.id : "";
+        const files = (await env.CLIP_KV.get(KV_FILES, "json")) || [];
+        if (!files.some(function (f) { return f.id === id; })) return json({ error: "文件不存在" }, 404);
+        const token = newId() + newId();
+        await env.CLIP_KV.put("dltoken:" + token, id, { expirationTtl: 180 });
+        return json({ url: "/api/download?t=" + token });
+      }
+
+      if (path === "/api/delete-file" && request.method === "POST") {
+        const body = await request.json().catch(function () { return {}; });
+        const id = typeof body.id === "string" ? body.id : "";
+        if (!id) return json({ error: "缺少文件 id" }, 400);
+        await env.CLIP_KV.delete(FILE_PREFIX + id);
+        let files = (await env.CLIP_KV.get(KV_FILES, "json")) || [];
+        files = files.filter(function (f) { return f.id !== id; });
+        await env.CLIP_KV.put(KV_FILES, JSON.stringify(files));
+        return json({ ok: true, files: files });
+      }
+
+      return json({ error: "not found" }, 404);
+    }
+
+    return new Response("Not found", { status: 404 });
+  }
+};
+
+const PAGE = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cloud Clipboard</title>
+<script>(function(){try{var t=localStorage.getItem("clip_theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f2f2f5;
+    --text: #1d1d1f;
+    --text-2: #5f5f66;
+    --text-3: #8e8e96;
+    --hairline: rgba(0, 0, 0, 0.07);
+    --glass-bg: rgba(255, 255, 255, 0.55);
+    --glass-border: rgba(255, 255, 255, 0.65);
+    --glass-edge: rgba(0, 0, 0, 0.05);
+    --glass-highlight: rgba(255, 255, 255, 0.75);
+    --field-bg: rgba(255, 255, 255, 0.5);
+    --btn-bg: rgba(255, 255, 255, 0.45);
+    --btn-bg-hover: rgba(255, 255, 255, 0.75);
+    --primary-bg: #1d1d1f;
+    --primary-bg-hover: #000000;
+    --primary-text: #ffffff;
+    --ring: rgba(0, 0, 0, 0.28);
+    --shadow: 0 12px 40px rgba(30, 30, 60, 0.10), 0 2px 8px rgba(30, 30, 60, 0.05);
+    --glow-1: rgba(140, 180, 255, 0.35);
+    --glow-2: rgba(190, 160, 255, 0.26);
+    --glow-3: rgba(255, 190, 150, 0.24);
+    --glow-4: rgba(150, 230, 200, 0.22);
+    --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #0a0a0d;
+      --text: #f5f5f7;
+      --text-2: #a7a7ae;
+      --text-3: #7c7c84;
+      --hairline: rgba(255, 255, 255, 0.10);
+      --glass-bg: rgba(32, 32, 36, 0.52);
+      --glass-border: rgba(255, 255, 255, 0.14);
+      --glass-edge: rgba(255, 255, 255, 0.06);
+      --glass-highlight: rgba(255, 255, 255, 0.10);
+      --field-bg: rgba(255, 255, 255, 0.07);
+      --btn-bg: rgba(255, 255, 255, 0.08);
+      --btn-bg-hover: rgba(255, 255, 255, 0.15);
+      --primary-bg: #f5f5f7;
+      --primary-bg-hover: #ffffff;
+      --primary-text: #000000;
+      --ring: rgba(255, 255, 255, 0.38);
+      --shadow: 0 12px 40px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.3);
+      --glow-1: rgba(80, 120, 255, 0.20);
+      --glow-2: rgba(150, 90, 255, 0.15);
+      --glow-3: rgba(255, 140, 90, 0.10);
+      --glow-4: rgba(60, 200, 160, 0.10);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0a0a0d;
+    --text: #f5f5f7;
+    --text-2: #a7a7ae;
+    --text-3: #7c7c84;
+    --hairline: rgba(255, 255, 255, 0.10);
+    --glass-bg: rgba(32, 32, 36, 0.52);
+    --glass-border: rgba(255, 255, 255, 0.14);
+    --glass-edge: rgba(255, 255, 255, 0.06);
+    --glass-highlight: rgba(255, 255, 255, 0.10);
+    --field-bg: rgba(255, 255, 255, 0.07);
+    --btn-bg: rgba(255, 255, 255, 0.08);
+    --btn-bg-hover: rgba(255, 255, 255, 0.15);
+    --primary-bg: #f5f5f7;
+    --primary-bg-hover: #ffffff;
+    --primary-text: #000000;
+    --ring: rgba(255, 255, 255, 0.38);
+    --shadow: 0 12px 40px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.3);
+    --glow-1: rgba(80, 120, 255, 0.20);
+    --glow-2: rgba(150, 90, 255, 0.15);
+    --glow-3: rgba(255, 140, 90, 0.10);
+    --glow-4: rgba(60, 200, 160, 0.10);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+    margin: 0; background: var(--bg); color: var(--text);
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+    transition: background-color 0.45s var(--ease), color 0.45s var(--ease);
+  }
+  body::before {
+    content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    background:
+      radial-gradient(680px 380px at 8% -40px, var(--glow-1), transparent 70%),
+      radial-gradient(760px 420px at 95% -60px, var(--glow-2), transparent 70%),
+      radial-gradient(600px 500px at 88% 108%, var(--glow-3), transparent 70%),
+      radial-gradient(560px 460px at 4% 104%, var(--glow-4), transparent 70%);
+  }
+  ::selection { background: rgba(128, 128, 140, 0.25); }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 48px 20px 80px; }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+  .rise { animation: rise 0.6s var(--ease) both; }
+  @media (prefers-reduced-motion: reduce) { .rise { animation: none; } * { transition: none !important; } }
+
+  /* ---------- 液态玻璃 ---------- */
+  .glass {
+    background: var(--glass-bg);
+    -webkit-backdrop-filter: blur(22px) saturate(180%); backdrop-filter: blur(22px) saturate(180%);
+    border: 1px solid var(--glass-border);
+    box-shadow: var(--shadow), inset 0 1px 0 var(--glass-highlight), inset 0 0 0 1px var(--glass-edge);
+  }
+  .theme-btn {
+    position: fixed; top: 14px; right: 16px; z-index: 60;
+    width: 40px; height: 40px; border-radius: 50%; padding: 0;
+    display: grid; place-items: center; color: var(--text-2);
+    background: var(--glass-bg);
+    -webkit-backdrop-filter: blur(18px) saturate(180%); backdrop-filter: blur(18px) saturate(180%);
+    border: 1px solid var(--glass-border);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.10), inset 0 1px 0 var(--glass-highlight);
+  }
+  .theme-btn:hover { background: var(--btn-bg-hover); }
+  .theme-btn svg { width: 19px; height: 19px; display: block; }
+
+  /* ---------- 通用 ---------- */
+  .card { border-radius: 22px; padding: 20px; transition: background-color 0.45s var(--ease), box-shadow 0.35s var(--ease); }
+  button {
+    font: inherit; cursor: pointer; border-radius: 980px;
+    padding: 9px 18px; font-size: 15px; font-weight: 500;
+    background: var(--btn-bg); color: var(--text);
+    border: 1px solid var(--glass-edge);
+    box-shadow: inset 0 1px 0 var(--glass-highlight), 0 1px 4px rgba(0, 0, 0, 0.05);
+    -webkit-backdrop-filter: blur(12px) saturate(160%); backdrop-filter: blur(12px) saturate(160%);
+    transition: background 0.35s var(--ease), transform 0.35s var(--ease), color 0.35s var(--ease);
+  }
+  button:hover { background: var(--btn-bg-hover); }
+  button:active { transform: scale(0.97); }
+  button.primary { background: var(--primary-bg); color: var(--primary-text); border-color: transparent; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18); }
+  button.primary:hover { background: var(--primary-bg-hover); }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+  .text-btn { background: none; border: 0; box-shadow: none; -webkit-backdrop-filter: none; backdrop-filter: none; color: var(--text-2); padding: 6px 4px; font-size: 15px; }
+  .text-btn:hover { background: none; color: var(--text); text-decoration: underline; }
+  .danger-text { background: none; border: 0; box-shadow: none; -webkit-backdrop-filter: none; backdrop-filter: none; color: var(--text-3); }
+  .danger-text:hover { background: none; color: var(--text); text-decoration: underline; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; align-items: center; }
+  .meta { font-size: 12.5px; color: var(--text-3); margin-left: auto; }
+  .msg { font-size: 13.5px; margin-top: 12px; min-height: 18px; color: var(--text-2); }
+  .msg:empty { margin-top: 0; min-height: 0; }
+  .msg.ok { color: var(--text-2); } .msg.err { color: var(--text); font-weight: 600; }
+  .sec-title { font-size: 12px; font-weight: 600; letter-spacing: 0.09em; color: var(--text-3); margin: 36px 6px 12px; }
+  .hidden { display: none; }
+  .empty { padding: 18px 20px; font-size: 14px; color: var(--text-3); }
+
+  /* ---------- 登录 ---------- */
+  .login-card { max-width: 400px; margin: 10vh auto 0; border-radius: 26px; padding: 36px 30px 30px; }
+  .login-title { font-size: 28px; font-weight: 800; letter-spacing: -0.025em; }
+  .login-sub { font-size: 14.5px; line-height: 1.55; color: var(--text-2); margin: 10px 0 24px; }
+  #loginBox input {
+    width: 100%; height: 50px; padding: 0 16px; font-size: 16px; color: var(--text);
+    background: var(--field-bg); border: 1px solid var(--glass-edge); border-radius: 13px;
+    box-shadow: inset 0 1px 0 var(--glass-highlight);
+    transition: border-color 0.3s var(--ease), box-shadow 0.3s var(--ease), background-color 0.45s var(--ease);
+  }
+  #loginBox input:focus { outline: none; border-color: var(--ring); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ring) 35%, transparent); }
+  #loginBox input::placeholder { color: var(--text-3); }
+  #loginBtn { width: 100%; height: 50px; font-size: 16px; font-weight: 600; margin-top: 14px; }
+
+  /* ---------- 主界面 ---------- */
+  .app-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .app-head h1 { font-size: 32px; font-weight: 800; letter-spacing: -0.03em; margin: 0; line-height: 1.12; }
+  .app-sub { font-size: 13.5px; color: var(--text-2); margin-top: 5px; }
+
+  .editor-card { padding: 20px 20px 16px; }
+  .editor-card:focus-within { box-shadow: var(--shadow), inset 0 1px 0 var(--glass-highlight), 0 0 0 4px color-mix(in srgb, var(--ring) 35%, transparent); }
+  textarea {
+    width: 100%; min-height: 240px; display: block;
+    font-family: inherit; font-size: 16px; line-height: 1.65; color: var(--text);
+    background: transparent; border: 0; padding: 2px; resize: vertical;
+  }
+  textarea:focus { outline: none; }
+  textarea::placeholder { color: var(--text-3); }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; border-top: 1px solid var(--hairline); margin-top: 14px; padding-top: 14px; }
+  .toolbar button { padding: 8px 16px; font-size: 14.5px; }
+  .toolbar .danger-text { border: 0; box-shadow: none; }
+  .toolbar .danger-text, .toolbar .meta { padding: 8px 2px; }
+
+  /* ---------- 上传拖放区 ---------- */
+  .dz {
+    position: relative; border: 1.5px dashed color-mix(in srgb, var(--text-3) 55%, transparent);
+    border-radius: 16px; padding: 28px 18px; text-align: center; cursor: pointer;
+    background: color-mix(in srgb, var(--glass-bg) 55%, transparent);
+    transition: border-color 0.3s var(--ease), background 0.3s var(--ease);
+  }
+  .dz:hover, .dz.over { border-color: var(--text-2); background: color-mix(in srgb, var(--text) 5%, transparent); }
+  .dz svg { width: 26px; height: 26px; color: var(--text-3); margin-bottom: 8px; }
+  .dz-text { font-size: 15px; font-weight: 500; word-break: break-all; }
+  .dz-hint { font-size: 12.5px; color: var(--text-3); margin-top: 5px; }
+  #fileInput { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+
+  /* ---------- 分组列表（文件 / 历史） ---------- */
+  .group { border-radius: 22px; overflow: hidden; transition: background-color 0.45s var(--ease); }
+  .file-item, .his-item { padding: 15px 20px; transition: background 0.25s var(--ease); }
+  .file-item:hover, .his-item:hover { background: color-mix(in srgb, var(--text) 3%, transparent); }
+  .file-item + .file-item, .his-item + .his-item { border-top: 1px solid var(--hairline); }
+  .file-name { font-size: 15px; font-weight: 500; word-break: break-all; }
+  .file-row, .his-row { display: flex; gap: 18px; margin-top: 7px; align-items: baseline; }
+  .file-row button, .his-row button { background: none; border: 0; box-shadow: none; -webkit-backdrop-filter: none; backdrop-filter: none; padding: 2px 0; font-size: 14px; font-weight: 500; color: var(--text); border-radius: 0; }
+  .file-row button:hover, .his-row button:hover { background: none; text-decoration: underline; }
+  .file-row button:active, .his-row button:active { transform: none; }
+  .file-row button + button { color: var(--text-3); }
+  .file-row button + button:hover { color: var(--text); }
+  .file-meta, .his-time { font-size: 12.5px; color: var(--text-3); margin-left: auto; white-space: nowrap; }
+  .his-text { font-size: 14.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-all; max-height: 68px; overflow: hidden; color: var(--text); }
+</style>
+</head>
+<body>
+<button class="theme-btn" id="themeBtn" aria-label="切换深浅色"></button>
+<div class="wrap">
+
+  <div id="loginBox" class="card glass login-card hidden">
+    <div class="login-title">Cloud Clipboard</div>
+    <div class="login-sub">输入口令后，即可在这台设备上查看和同步你的文字与文件。</div>
+    <input id="pw" type="password" placeholder="口令" autocomplete="current-password">
+    <button class="primary" id="loginBtn">进入</button>
+    <div class="msg err" id="loginMsg"></div>
+  </div>
+
+  <div id="mainBox" class="hidden">
+    <div class="app-head rise">
+      <div>
+        <h1>Cloud Clipboard</h1>
+        <div class="app-sub">文字与文件，跨设备同步</div>
+      </div>
+      <button class="text-btn" id="logoutBtn">退出</button>
+    </div>
+
+    <h2 class="sec-title">文本</h2>
+    <div class="card glass editor-card rise">
+      <textarea id="txt" placeholder="在这里粘贴文字，然后点「保存到云端」……"></textarea>
+      <div class="toolbar">
+        <button class="primary" id="saveBtn">保存到云端</button>
+        <button id="copyBtn">复制</button>
+        <button id="refreshBtn">拉取最新</button>
+        <button class="danger-text" id="clearBtn">清空</button>
+        <span class="meta" id="meta"></span>
+      </div>
+      <div class="msg" id="msg"></div>
+    </div>
+
+    <h2 class="sec-title">文件</h2>
+    <div class="card glass rise">
+      <div class="dz" id="dz">
+        <input type="file" id="fileInput">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V5"/><path d="M6.5 10.5L12 5l5.5 5.5"/><path d="M4 19.5h16"/></svg>
+        <div class="dz-text" id="dzText">点击选择文件，或把文件拖到这里</div>
+        <div class="dz-hint">单个文件 ≤ 10 MB · 最多保留 50 个</div>
+      </div>
+      <div class="row">
+        <button class="primary" id="uploadBtn">上传</button>
+      </div>
+      <div class="msg" id="fileMsg"></div>
+    </div>
+    <div id="fileList" class="group glass rise" style="margin-top:12px"></div>
+
+    <h2 class="sec-title">历史记录</h2>
+    <div id="his" class="group glass rise"></div>
+  </div>
+</div>
+
+<script>
+var key = localStorage.getItem("clip_key") || "";
+var lastUpdated = 0;
+var dirty = false;
+
+function $(id) { return document.getElementById(id); }
+function fmt(t) {
+  if (!t) return "暂无内容";
+  var d = new Date(t);
+  function p(n) { return (n < 10 ? "0" : "") + n; }
+  return "上次保存：" + d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+function fmtTime(t) {
+  if (!t) return "";
+  var d = new Date(t);
+  function p(n) { return (n < 10 ? "0" : "") + n; }
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+function fmtSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(2) + " MB";
+}
+function setMsg(s, ok) { var m = $("msg"); m.textContent = s || ""; m.className = "msg " + (ok ? "ok" : "err"); }
+function setFileMsg(s, ok) { var m = $("fileMsg"); m.textContent = s || ""; m.className = "msg " + (ok ? "ok" : "err"); }
+function headers() { return { "Content-Type": "application/json", "X-Key": key }; }
+
+function showMain() { $("loginBox").classList.add("hidden"); $("mainBox").classList.remove("hidden"); }
+function showLogin() { $("mainBox").classList.add("hidden"); $("loginBox").classList.remove("hidden"); }
+
+/* ---------- 主题切换 ---------- */
+var SUN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2.2M12 19.3v2.2M4.3 4.3l1.6 1.6M18.1 18.1l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.3 19.7l1.6-1.6M18.1 5.9l1.6-1.6"/></svg>';
+var MOON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 13.2A8.5 8.5 0 1 1 10.8 3.5a7 7 0 0 0 9.7 9.7Z"/></svg>';
+function effectiveTheme() {
+  var t = document.documentElement.getAttribute("data-theme");
+  if (t) return t;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+function paintThemeBtn() {
+  var dark = effectiveTheme() === "dark";
+  $("themeBtn").innerHTML = dark ? SUN : MOON;
+  $("themeBtn").setAttribute("aria-label", dark ? "切换到浅色" : "切换到深色");
+}
+$("themeBtn").onclick = function () {
+  var next = effectiveTheme() === "dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
+  try { localStorage.setItem("clip_theme", next); } catch (e) {}
+  paintThemeBtn();
+};
+paintThemeBtn();
+
+function renderHistory(his) {
+  var box = $("his");
+  box.innerHTML = "";
+  if (!his || !his.length) { box.innerHTML = '<div class="empty">暂无历史记录，保存新内容后，旧内容会留在这里。</div>'; return; }
+  his.forEach(function (item) {
+    var div = document.createElement("div");
+    div.className = "his-item";
+    var t = document.createElement("div");
+    t.className = "his-text";
+    t.textContent = item.text;
+    var row = document.createElement("div");
+    row.className = "his-row";
+    var b1 = document.createElement("button");
+    b1.textContent = "复制";
+    b1.onclick = function () { copyText(item.text); };
+    var b2 = document.createElement("button");
+    b2.textContent = "载入编辑框";
+    b2.onclick = function () { $("txt").value = item.text; dirty = true; setMsg("已载入，记得点保存", true); window.scrollTo(0, 0); };
+    var tm = document.createElement("span");
+    tm.className = "his-time";
+    tm.textContent = fmt(item.updatedAt).replace("上次保存：", "");
+    row.appendChild(b1); row.appendChild(b2); row.appendChild(tm);
+    div.appendChild(t); div.appendChild(row);
+    box.appendChild(div);
+  });
+}
+
+function renderFiles(files) {
+  var box = $("fileList");
+  box.innerHTML = "";
+  if (!files || !files.length) { box.innerHTML = '<div class="empty">暂无文件，在上方选择文件并上传。</div>'; return; }
+  files.forEach(function (f) {
+    var div = document.createElement("div");
+    div.className = "file-item";
+    var nm = document.createElement("div");
+    nm.className = "file-name";
+    nm.textContent = f.name;
+    var row = document.createElement("div");
+    row.className = "file-row";
+    var b1 = document.createElement("button");
+    b1.textContent = "下载";
+    b1.onclick = function () { downloadFile(f.id, f.name); };
+    var b2 = document.createElement("button");
+    b2.textContent = "删除";
+    b2.onclick = function () { deleteFile(f.id, f.name); };
+    var mt = document.createElement("span");
+    mt.className = "file-meta";
+    mt.textContent = fmtSize(f.size || 0) + " · " + fmtTime(f.updatedAt);
+    row.appendChild(b1); row.appendChild(b2); row.appendChild(mt);
+    div.appendChild(nm); div.appendChild(row);
+    box.appendChild(div);
+  });
+}
+
+function copyText(s) {
+  function done() { setMsg("已复制到剪贴板", true); }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(s).then(done, function () { fallback(); });
+  } else { fallback(); }
+  function fallback() {
+    var ta = document.createElement("textarea");
+    ta.value = s; document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); done(); } catch (e) { setMsg("复制失败，请手动全选复制", false); }
+    document.body.removeChild(ta);
+  }
+}
+
+function load(silent) {
+  return fetch("/api/get", { headers: headers() }).then(function (r) {
+    if (r.status === 401) { showLogin(); throw new Error("口令不正确"); }
+    return r.json();
+  }).then(function (d) {
+    showMain();
+    if (!dirty) { $("txt").value = d.text || ""; }
+    lastUpdated = d.updatedAt || 0;
+    $("meta").textContent = fmt(lastUpdated) + " · " + (($("txt").value || "").length) + " 字";
+    renderHistory(d.history || []);
+    if (!silent) setMsg("已拉取最新内容", true);
+  }).catch(function (e) { if (!silent) setMsg(String(e.message || e), false); });
+}
+
+function loadFiles() {
+  return fetch("/api/files", { headers: headers() }).then(function (r) {
+    return r.json();
+  }).then(function (d) {
+    if (d && d.files) renderFiles(d.files);
+  }).catch(function () {});
+}
+
+function downloadFile(id, name) {
+  setFileMsg("正在准备下载 " + name + " …", true);
+  fetch("/api/download-token", { method: "POST", headers: headers(), body: JSON.stringify({ id: id }) })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d || d.error || !d.url) { setFileMsg("下载失败：" + ((d && d.error) || "无法生成下载链接"), false); return; }
+      var a = document.createElement("a");
+      a.href = d.url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setFileMsg("已开始下载 " + name, true);
+    })
+    .catch(function (e) { setFileMsg("下载失败：" + e.message, false); });
+}
+
+function deleteFile(id, name) {
+  if (!confirm("确定要删除文件「" + name + "」吗？")) return;
+  fetch("/api/delete-file", { method: "POST", headers: headers(), body: JSON.stringify({ id: id }) })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (d.error) { setFileMsg(d.error, false); return; }
+      renderFiles(d.files || []);
+      setFileMsg("已删除 " + name, true);
+    })
+    .catch(function (e) { setFileMsg("删除失败：" + e.message, false); });
+}
+
+/* ---------- 拖放区 ---------- */
+function showPicked(f) {
+  if (f) $("dzText").textContent = f.name + "（" + fmtSize(f.size) + "）— 点下方「上传」发送";
+}
+$("fileInput").addEventListener("change", function () {
+  if (this.files && this.files.length) showPicked(this.files[0]);
+});
+["dragenter", "dragover"].forEach(function (ev) {
+  $("dz").addEventListener(ev, function (e) { e.preventDefault(); $("dz").classList.add("over"); });
+});
+["dragleave", "drop"].forEach(function (ev) {
+  $("dz").addEventListener(ev, function (e) { e.preventDefault(); $("dz").classList.remove("over"); });
+});
+$("dz").addEventListener("drop", function (e) {
+  var files = e.dataTransfer && e.dataTransfer.files;
+  if (files && files.length) {
+    try { $("fileInput").files = files; } catch (err) {}
+    showPicked(files[0]);
+  }
+});
+
+$("uploadBtn").onclick = function () {
+  var input = $("fileInput");
+  if (!input.files || !input.files.length) { setFileMsg("先点「选择文件」选一个文件", false); return; }
+  var file = input.files[0];
+  if (file.size > 10 * 1024 * 1024) { setFileMsg("文件超过 10 MB 上限", false); return; }
+  setFileMsg("正在读取并上传 " + file.name + " …", true);
+  var reader = new FileReader();
+  reader.onload = function () {
+    var dataUrl = String(reader.result || "");
+    var comma = dataUrl.indexOf(",");
+    var base64 = comma >= 0 ? dataUrl.slice(comma + 1) : "";
+    fetch("/api/upload", { method: "POST", headers: headers(), body: JSON.stringify({ name: file.name, type: file.type || "", data: base64 }) })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.error) { setFileMsg("上传失败：" + d.error, false); return; }
+        renderFiles(d.files || []);
+        input.value = "";
+        $("dzText").textContent = "点击选择文件，或把文件拖到这里";
+        setFileMsg("已上传 " + file.name, true);
+      })
+      .catch(function (e) { setFileMsg("上传失败：" + e.message, false); });
+  };
+  reader.onerror = function () { setFileMsg("读取文件失败", false); };
+  reader.readAsDataURL(file);
+};
+
+$("loginBtn").onclick = function () {
+  key = $("pw").value;
+  if (!key) { $("loginMsg").textContent = "口令不能为空"; return; }
+  localStorage.setItem("clip_key", key);
+  load(false).then(function () { $("loginMsg").textContent = ""; loadFiles(); }).catch(function () {
+    $("loginMsg").textContent = "口令不正确，请重试";
+    localStorage.removeItem("clip_key");
+  });
+};
+$("pw").addEventListener("keydown", function (e) { if (e.key === "Enter") $("loginBtn").click(); });
+
+$("txt").addEventListener("input", function () {
+  dirty = true;
+  $("meta").textContent = fmt(lastUpdated) + " · " + $("txt").value.length + " 字（未保存）";
+});
+
+$("saveBtn").onclick = function () {
+  fetch("/api/save", { method: "POST", headers: headers(), body: JSON.stringify({ text: $("txt").value }) })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (d.error) { setMsg(d.error, false); return; }
+      dirty = false; lastUpdated = d.updatedAt;
+      $("meta").textContent = fmt(lastUpdated) + " · " + $("txt").value.length + " 字";
+      renderHistory(d.history || []);
+      setMsg("已保存到云端 ✓", true);
+    })
+    .catch(function (e) { setMsg("保存失败：" + e.message, false); });
+};
+
+$("copyBtn").onclick = function () { copyText($("txt").value); };
+$("refreshBtn").onclick = function () {
+  if (dirty && !confirm("你有未保存的修改，拉取最新会覆盖，确定吗？")) return;
+  dirty = false; load(false); loadFiles();
+};
+$("clearBtn").onclick = function () {
+  if (!confirm("确定要清空云端当前内容吗？（历史里还能找回）")) return;
+  fetch("/api/clear", { method: "POST", headers: headers(), body: "{}" })
+    .then(function () { $("txt").value = ""; dirty = false; setMsg("已清空", true); load(true); });
+};
+$("logoutBtn").onclick = function () { localStorage.removeItem("clip_key"); key = ""; showLogin(); };
+
+if (key) { load(true); loadFiles(); } else { showLogin(); }
+setInterval(function () { if (key && !dirty) load(true); }, 5000);
+</script>
+</body>
+</html>
+`;
